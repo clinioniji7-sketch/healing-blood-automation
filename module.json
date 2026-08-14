@@ -1,0 +1,21 @@
+{
+  "id": "healing-blood-automation",
+  "title": "Healing Blood Automation",
+  "description": "Automação da técnica Healing Blood para Foundry VTT: acumula dano sofrido, cura o portador no fim de cada turno e tenta curar atacantes corpo a corpo.",
+  "version": "1.0.0",
+  "compatibility": {
+    "minimum": "14",
+    "verified": "14"
+  },
+  "authors": [
+    {
+      "name": "clinioniji7-sketch"
+    }
+  ],
+  "esmodules": [
+    "scripts/healing-blood.js"
+  ],
+  "url": "https://github.com/clinioniji7-sketch/healing-blood-automation",
+  "manifest": "https://raw.githubusercontent.com/clinioniji7-sketch/healing-blood-automation/main/module.json",
+  "download": "https://github.com/clinioniji7-sketch/healing-blood-automation/archive/refs/heads/main.zip"
+}
