@@ -1,6 +1,9 @@
 const HB_EFFECT_NAME = "Healing Blood";
 const HB_FLAG_DAMAGE = "healingBloodDamage";
 const HB_FLAG_SCOPE = "world";
+const RECENT_ATTACK_MS = 10000;
+
+const recentMeleeAttacks = [];
 
 function hasHealingBlood(actor) {
   if (!actor) return false;
@@ -20,45 +23,128 @@ function getHP(actor) {
 async function healActor(actor, amount) {
   if (!actor) return 0;
   amount = Math.max(0, Number(amount) || 0);
-
   const hp = getHP(actor);
   const missing = Math.max(0, hp.max - hp.value);
   const effective = Math.min(amount, missing);
-
   if (effective <= 0) return 0;
-
-  await actor.update({
-    "system.attributes.hp.value": hp.value + effective
-  });
-
+  await actor.update({ "system.attributes.hp.value": hp.value + effective });
   return effective;
 }
 
 async function accumulateDamage(actor, amount) {
   if (!actor) return;
-
   amount = Math.max(0, Number(amount) || 0);
   if (amount <= 0) return;
-
-  const current =
-    Number(actor.getFlag(HB_FLAG_SCOPE, HB_FLAG_DAMAGE)) || 0;
-
-  await actor.setFlag(
-    HB_FLAG_SCOPE,
-    HB_FLAG_DAMAGE,
-    current + amount
-  );
-
-  console.log(
-    `Healing Blood | ${actor.name}: +${amount} dano acumulado (${current + amount} total).`
-  );
+  const current = Number(actor.getFlag(HB_FLAG_SCOPE, HB_FLAG_DAMAGE)) || 0;
+  await actor.setFlag(HB_FLAG_SCOPE, HB_FLAG_DAMAGE, current + amount);
+  console.log(`Healing Blood | ${actor.name}: +${amount} dano acumulado (${current + amount} total).`);
 }
 
 async function clearDamage(actor) {
   if (!actor) return;
-  try {
-    await actor.unsetFlag(HB_FLAG_SCOPE, HB_FLAG_DAMAGE);
-  } catch (_) {}
+  try { await actor.unsetFlag(HB_FLAG_SCOPE, HB_FLAG_DAMAGE); } catch (_) {}
+}
+
+function asActor(document) {
+  if (!document) return null;
+  if (document.documentName === "Actor") return document;
+  if (document.actor) return document.actor;
+  if (document.parent?.documentName === "Actor") return document.parent;
+  if (document.item?.actor) return document.item.actor;
+  return null;
+}
+
+function isMeleeActivity(activity) {
+  if (!activity) return false;
+  const item = activity.item ?? activity.parent ?? null;
+  const values = [
+    activity.actionType,
+    activity.system?.actionType,
+    activity.attack?.type?.value,
+    activity.system?.attack?.type?.value,
+    item?.system?.actionType
+  ].filter(v => v != null).map(v => String(v).toLowerCase());
+  if (values.some(v => ["mwak", "msak", "melee"].includes(v))) return true;
+  const attackType = activity.attack?.type?.value ?? activity.system?.attack?.type?.value ?? null;
+  return ["melee", "mwak", "msak"].includes(String(attackType ?? "").toLowerCase());
+}
+
+function collectTargetActorIds(...sources) {
+  const ids = new Set();
+  const visit = value => {
+    if (!value) return;
+    if (typeof value === "string") {
+      const actorMatch = value.match(/Actor\.([^.]+)/);
+      if (actorMatch) ids.add(actorMatch[1]);
+      const tokenActor = canvas.tokens?.placeables?.find(t => t.document?.uuid === value || t.uuid === value)?.actor;
+      if (tokenActor?.id) ids.add(tokenActor.id);
+      return;
+    }
+    if (value instanceof Set || Array.isArray(value)) {
+      for (const entry of value) visit(entry);
+      return;
+    }
+    if (typeof value[Symbol.iterator] === "function" && typeof value !== "string") {
+      try { for (const entry of value) visit(entry); return; } catch (_) {}
+    }
+    const actor = asActor(value);
+    if (actor?.id) ids.add(actor.id);
+    if (value.actorId) ids.add(value.actorId);
+    if (value.actor?.id) ids.add(value.actor.id);
+    if (value.token?.actor?.id) ids.add(value.token.actor.id);
+    if (value.document?.actor?.id) ids.add(value.document.actor.id);
+    for (const key of ["targets","target","targetUuids","targetUUIDs","targetIds","tokens"]) {
+      if (value[key]) visit(value[key]);
+    }
+  };
+  for (const source of sources) visit(source);
+  return ids;
+}
+
+function purgeOldAttacks() {
+  const cutoff = Date.now() - RECENT_ATTACK_MS;
+  while (recentMeleeAttacks.length && recentMeleeAttacks[0].time < cutoff) recentMeleeAttacks.shift();
+}
+
+function rememberMeleeAttack(activity, usageConfig = {}, results = {}) {
+  if (!isMeleeActivity(activity)) return;
+  const attacker = asActor(activity) ?? asActor(activity.item) ?? activity.actor ?? activity.item?.actor ?? null;
+  if (!attacker) return;
+  const targetActorIds = collectTargetActorIds(
+    usageConfig?.targets,
+    usageConfig?.target,
+    usageConfig?.targetUuids,
+    results?.targets,
+    results?.target,
+    results?.targetUuids,
+    results
+  );
+  recentMeleeAttacks.push({ time: Date.now(), attacker, targetActorIds, activity });
+  purgeOldAttacks();
+  console.log("Healing Blood | Ataque corpo a corpo registrado:", attacker.name, [...targetActorIds]);
+}
+
+function findRecentMeleeAttacker(targetActor) {
+  purgeOldAttacks();
+  const matching = [...recentMeleeAttacks].reverse().filter(entry =>
+    entry.targetActorIds.size === 0 || entry.targetActorIds.has(targetActor.id)
+  );
+  return matching[0] ?? null;
+}
+
+async function healMeleeAttacker(attacker, targetActor, damage) {
+  if (!attacker || !targetActor) return;
+  if (attacker.id === targetActor.id) return;
+  damage = Math.max(0, Number(damage) || 0);
+  const dice = Math.floor(damage / 7);
+  if (dice <= 0) return;
+  const roll = await new Roll(`${dice}d4`).evaluate();
+  const effectiveHealing = await healActor(attacker, roll.total);
+  await roll.toMessage({
+    speaker: ChatMessage.getSpeaker({ actor: attacker }),
+    flavor: `<b>Healing Blood</b><br>${attacker.name} causou <b>${damage} de dano corpo a corpo</b> em ${targetActor.name}.<br>O sangue curativo concede <b>${dice}d4</b> de cura.<br>Resultado: <b>${roll.total}</b> | Cura efetiva: <b>${effectiveHealing} PV</b>.`
+  });
+  console.log(`Healing Blood | ${attacker.name} recuperou ${effectiveHealing} PV após causar ${damage} de dano corpo a corpo em ${targetActor.name}.`);
 }
 
 Hooks.once("ready", () => {
@@ -67,211 +153,124 @@ Hooks.once("ready", () => {
     return;
   }
 
-  console.log("Healing Blood | Iniciando automação v1.0.1...");
+  console.log("Healing Blood | Iniciando automação v1.0.2...");
 
-  // CONTADOR DE DANO: usa dnd5e.damageActor, que detecta perda de PV por qualquer meio.
-  const actorDamageHook = Hooks.on(
-    "dnd5e.damageActor",
-    async (actor, changes = {}, update = {}, userId) => {
-      if (!game.user.isGM) return;
-      if (!actor) return;
-      if (!hasHealingBlood(actor)) return;
+  const activityHook = Hooks.on("dnd5e.postUseActivity", (activity, usageConfig = {}, results = {}) => {
+    if (!game.user.isGM) return;
+    rememberMeleeAttack(activity, usageConfig, results);
+  });
 
-      let amount = Math.abs(Number(changes?.total) || 0);
+  const actorDamageHook = Hooks.on("dnd5e.damageActor", async (actor, changes = {}, update = {}, userId) => {
+    if (!game.user.isGM) return;
+    if (!actor) return;
+    if (!hasHealingBlood(actor)) return;
 
-      if (amount <= 0) {
-        const hpLoss = Math.min(0, Number(changes?.hp) || 0);
-        const tempLoss = Math.min(0, Number(changes?.temp) || 0);
-        amount = Math.abs(hpLoss + tempLoss);
-      }
-
-      if (amount <= 0) return;
-
-      await accumulateDamage(actor, amount);
+    let amount = Math.abs(Number(changes?.total) || 0);
+    if (amount <= 0) {
+      const hpLoss = Math.min(0, Number(changes?.hp) || 0);
+      const tempLoss = Math.min(0, Number(changes?.temp) || 0);
+      amount = Math.abs(hpLoss + tempLoss);
     }
-  );
+    if (amount <= 0) return;
 
-  // applyDamage fica apenas para tentar identificar quem atacou corpo a corpo.
-  const applyDamageHook = Hooks.on(
-    "dnd5e.applyDamage",
-    async (actor, amount, options = {}) => {
-      if (!game.user.isGM) return;
-      if (!actor) return;
-      if (!hasHealingBlood(actor)) return;
+    await accumulateDamage(actor, amount);
 
-      amount = Math.max(0, Number(amount) || 0);
-      if (amount <= 0) return;
+    const attack = findRecentMeleeAttacker(actor);
+    if (attack?.attacker) {
+      await healMeleeAttacker(attack.attacker, actor, amount);
+      const index = recentMeleeAttacks.indexOf(attack);
+      if (index >= 0) recentMeleeAttacks.splice(index, 1);
+    }
+  });
 
-      let attacker =
-        options?.sourceActor ??
-        options?.source?.actor ??
-        options?.actor ??
-        null;
+  const recentlyHealedApplications = new Map();
 
-      let item =
-        options?.item ??
-        options?.sourceItem ??
-        options?.source?.item ??
-        null;
+  const applyDamageHook = Hooks.on("dnd5e.applyDamage", async (actor, amount, options = {}) => {
+    if (!game.user.isGM) return;
+    if (!actor) return;
+    if (!hasHealingBlood(actor)) return;
 
-      if (typeof attacker === "string") {
-        try {
-          attacker = await fromUuid(attacker);
-        } catch (_) {
-          attacker = null;
-        }
-      }
+    amount = Math.max(0, Number(amount) || 0);
+    if (amount <= 0) return;
 
-      if (typeof item === "string") {
-        try {
-          item = await fromUuid(item);
-        } catch (_) {
-          item = null;
-        }
-      }
+    let attacker = options?.sourceActor ?? options?.source?.actor ?? options?.actor ?? asActor(options?.activity) ?? asActor(options?.item) ?? null;
+    let activity = options?.activity ?? null;
+    let item = options?.item ?? options?.sourceItem ?? options?.source?.item ?? null;
 
-      if (!attacker) return;
-      if (attacker.actor) attacker = attacker.actor;
+    if (typeof attacker === "string") {
+      try { attacker = await fromUuid(attacker); } catch (_) { attacker = null; }
+    }
+    if (typeof item === "string") {
+      try { item = await fromUuid(item); } catch (_) { item = null; }
+    }
 
-      let actionType =
-        item?.system?.actionType ??
-        options?.activity?.actionType ??
-        options?.activity?.system?.actionType ??
-        null;
+    attacker = asActor(attacker) ?? attacker;
+    let melee = isMeleeActivity(activity);
+    if (!melee && item) {
+      const actionType = String(item?.system?.actionType ?? "").toLowerCase();
+      melee = ["mwak", "msak"].includes(actionType);
+    }
+    if (!attacker || !melee) return;
 
-      if (!actionType && item) {
-        const activities = item.system?.activities;
-        const firstActivity =
-          activities?.contents?.[0] ??
-          activities?.[0] ??
-          null;
+    const key = `${actor.id}:${attacker.id}:${amount}`;
+    const last = recentlyHealedApplications.get(key) ?? 0;
+    if (Date.now() - last < 1000) return;
 
-        actionType =
-          firstActivity?.actionType ??
-          firstActivity?.system?.actionType ??
-          firstActivity?.type ??
-          null;
-      }
+    recentlyHealedApplications.set(key, Date.now());
+    setTimeout(() => recentlyHealedApplications.delete(key), 1500);
+    await healMeleeAttacker(attacker, actor, amount);
+  });
 
-      const isMelee = ["mwak", "msak"].includes(actionType);
-      if (!isMelee) return;
+  const combatHook = Hooks.on("updateCombat", async (combat, changed) => {
+    if (!game.user.isGM) return;
+    const turnChanged = Object.prototype.hasOwnProperty.call(changed, "turn");
+    const roundChanged = Object.prototype.hasOwnProperty.call(changed, "round");
+    if (!turnChanged && !roundChanged) return;
 
-      const dice = Math.floor(amount / 7);
-      if (dice <= 0) return;
+    const processedActors = new Set();
+    for (const combatant of combat.combatants) {
+      const actor = combatant.actor;
+      if (!actor) continue;
+      if (processedActors.has(actor.id)) continue;
+      processedActors.add(actor.id);
+      if (!hasHealingBlood(actor)) continue;
 
-      const roll = await new Roll(`${dice}d4`).evaluate();
-      const effectiveHealing = await healActor(attacker, roll.total);
+      const damage = Number(actor.getFlag(HB_FLAG_SCOPE, HB_FLAG_DAMAGE)) || 0;
+      if (damage <= 0) continue;
 
-      await roll.toMessage({
-        speaker: ChatMessage.getSpeaker({ actor: attacker }),
-        flavor:
-          `<b>Healing Blood</b><br>` +
-          `${attacker.name} causou <b>${amount} de dano corpo a corpo</b> em ${actor.name}.<br>` +
-          `Healing Blood concede <b>${dice}d4</b> de cura.<br>` +
-          `Cura efetiva: <b>${effectiveHealing} PV</b>.`
+      const dexMod = Number(foundry.utils.getProperty(actor, "system.abilities.dex.mod")) || 0;
+      const halfDamage = Math.floor(damage / 2);
+      const healing = Math.max(0, halfDamage + dexMod);
+      const effectiveHealing = await healActor(actor, healing);
+      await clearDamage(actor);
+
+      await ChatMessage.create({
+        speaker: ChatMessage.getSpeaker({ actor }),
+        content: `<div class="chat-card"><h2>Healing Blood</h2><p><b>${actor.name}</b> sofreu <b>${damage} de dano</b> durante o turno.</p><p>Metade do dano: <b>${halfDamage}</b><br>Mod. Agilidade: <b>${dexMod >= 0 ? "+" : ""}${dexMod}</b></p><hr><p>Recupera <b>${effectiveHealing} PV</b>.</p></div>`
       });
     }
-  );
+  });
 
-  const combatHook = Hooks.on(
-    "updateCombat",
-    async (combat, changed) => {
-      if (!game.user.isGM) return;
+  const effectUpdateHook = Hooks.on("updateActiveEffect", async (effect, changed) => {
+    if (!game.user.isGM) return;
+    const actor = effect.parent;
+    if (!actor) return;
+    if (effect.name?.toLowerCase() !== HB_EFFECT_NAME.toLowerCase()) return;
+    if (changed.disabled === true) await clearDamage(actor);
+  });
 
-      const turnChanged =
-        Object.prototype.hasOwnProperty.call(changed, "turn");
-
-      const roundChanged =
-        Object.prototype.hasOwnProperty.call(changed, "round");
-
-      if (!turnChanged && !roundChanged) return;
-
-      const processedActors = new Set();
-
-      for (const combatant of combat.combatants) {
-        const actor = combatant.actor;
-        if (!actor) continue;
-        if (processedActors.has(actor.id)) continue;
-
-        processedActors.add(actor.id);
-
-        if (!hasHealingBlood(actor)) continue;
-
-        const damage =
-          Number(actor.getFlag(HB_FLAG_SCOPE, HB_FLAG_DAMAGE)) || 0;
-
-        if (damage <= 0) continue;
-
-        const dexMod =
-          Number(
-            foundry.utils.getProperty(
-              actor,
-              "system.abilities.dex.mod"
-            )
-          ) || 0;
-
-        const halfDamage = Math.floor(damage / 2);
-        const healing = Math.max(0, halfDamage + dexMod);
-
-        const effectiveHealing =
-          await healActor(actor, healing);
-
-        await clearDamage(actor);
-
-        await ChatMessage.create({
-          speaker: ChatMessage.getSpeaker({ actor }),
-          content:
-            `<div class="chat-card">` +
-            `<h2>Healing Blood</h2>` +
-            `<p><b>${actor.name}</b> sofreu <b>${damage} de dano</b> durante o turno.</p>` +
-            `<p>Metade do dano: <b>${halfDamage}</b><br>` +
-            `Mod. Agilidade: <b>${dexMod >= 0 ? "+" : ""}${dexMod}</b></p>` +
-            `<hr><p>Recupera <b>${effectiveHealing} PV</b>.</p>` +
-            `</div>`
-        });
-      }
-    }
-  );
-
-  const effectUpdateHook = Hooks.on(
-    "updateActiveEffect",
-    async (effect, changed) => {
-      if (!game.user.isGM) return;
-
-      const actor = effect.parent;
-      if (!actor) return;
-
-      if (
-        effect.name?.toLowerCase() !==
-        HB_EFFECT_NAME.toLowerCase()
-      ) return;
-
-      if (changed.disabled === true) {
-        await clearDamage(actor);
-      }
-    }
-  );
-
-  const effectDeleteHook = Hooks.on(
-    "deleteActiveEffect",
-    async effect => {
-      if (!game.user.isGM) return;
-
-      const actor = effect.parent;
-      if (!actor) return;
-
-      if (
-        effect.name?.toLowerCase() !==
-        HB_EFFECT_NAME.toLowerCase()
-      ) return;
-
-      await clearDamage(actor);
-    }
-  );
+  const effectDeleteHook = Hooks.on("deleteActiveEffect", async effect => {
+    if (!game.user.isGM) return;
+    const actor = effect.parent;
+    if (!actor) return;
+    if (effect.name?.toLowerCase() !== HB_EFFECT_NAME.toLowerCase()) return;
+    await clearDamage(actor);
+  });
 
   globalThis.HealingBloodAutomation = {
     active: true,
-    version: "1.0.1",
+    version: "1.0.2",
+    activityHook,
     actorDamageHook,
     applyDamageHook,
     combatHook,
@@ -279,11 +278,6 @@ Hooks.once("ready", () => {
     effectDeleteHook
   };
 
-  ui.notifications.info(
-    "Healing Blood Automation v1.0.1 carregada."
-  );
-
-  console.log(
-    "Healing Blood | Automação v1.0.1 ativa."
-  );
+  ui.notifications.info("Healing Blood Automation v1.0.2 carregada.");
+  console.log("Healing Blood | Automação v1.0.2 ativa.");
 });
