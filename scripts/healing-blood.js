@@ -1,9 +1,8 @@
 const HB_EFFECT_NAME = "Healing Blood";
 const HB_FLAG_DAMAGE = "healingBloodDamage";
+const HB_FLAG_ATTACK = "healingBloodLastAttack";
 const HB_FLAG_SCOPE = "world";
-const RECENT_ATTACK_MS = 10000;
-
-const recentMeleeAttacks = [];
+const RECENT_ATTACK_MS = 15000;
 
 function hasHealingBlood(actor) {
   if (!actor) return false;
@@ -54,19 +53,39 @@ function asActor(document) {
   return null;
 }
 
+function getActivityItem(activity) {
+  return activity?.item ?? activity?.parent ?? null;
+}
+
+function isAttackActivity(activity) {
+  if (!activity) return false;
+  const values = [activity.type, activity.constructor?.name, activity.system?.type]
+    .filter(Boolean)
+    .map(v => String(v).toLowerCase());
+  return values.some(v => v.includes("attack"));
+}
+
 function isMeleeActivity(activity) {
   if (!activity) return false;
-  const item = activity.item ?? activity.parent ?? null;
+  const item = getActivityItem(activity);
   const values = [
     activity.actionType,
     activity.system?.actionType,
+    activity.attack?.type,
     activity.attack?.type?.value,
+    activity.system?.attack?.type,
     activity.system?.attack?.type?.value,
+    activity.range?.units,
+    activity.system?.range?.units,
     item?.system?.actionType
-  ].filter(v => v != null).map(v => String(v).toLowerCase());
-  if (values.some(v => ["mwak", "msak", "melee"].includes(v))) return true;
-  const attackType = activity.attack?.type?.value ?? activity.system?.attack?.type?.value ?? null;
-  return ["melee", "mwak", "msak"].includes(String(attackType ?? "").toLowerCase());
+  ].filter(v => v !== null && v !== undefined).map(v => String(v).toLowerCase());
+  if (values.some(v => ["mwak", "msak", "melee", "touch"].includes(v))) return true;
+  if (values.some(v => v.includes("melee"))) return true;
+  if (isAttackActivity(activity)) {
+    const range = Number(activity.range?.value ?? activity.system?.range?.value ?? item?.system?.range?.value);
+    if (Number.isFinite(range) && range > 0 && range <= 5) return true;
+  }
+  return false;
 }
 
 function collectTargetActorIds(...sources) {
@@ -76,15 +95,15 @@ function collectTargetActorIds(...sources) {
     if (typeof value === "string") {
       const actorMatch = value.match(/Actor\.([^.]+)/);
       if (actorMatch) ids.add(actorMatch[1]);
-      const tokenActor = canvas.tokens?.placeables?.find(t => t.document?.uuid === value || t.uuid === value)?.actor;
-      if (tokenActor?.id) ids.add(tokenActor.id);
+      const token = canvas.tokens?.placeables?.find(t => t.document?.uuid === value || t.uuid === value || t.id === value);
+      if (token?.actor?.id) ids.add(token.actor.id);
       return;
     }
     if (value instanceof Set || Array.isArray(value)) {
       for (const entry of value) visit(entry);
       return;
     }
-    if (typeof value[Symbol.iterator] === "function" && typeof value !== "string") {
+    if (typeof value !== "string" && typeof value?.[Symbol.iterator] === "function") {
       try { for (const entry of value) visit(entry); return; } catch (_) {}
     }
     const actor = asActor(value);
@@ -93,7 +112,7 @@ function collectTargetActorIds(...sources) {
     if (value.actor?.id) ids.add(value.actor.id);
     if (value.token?.actor?.id) ids.add(value.token.actor.id);
     if (value.document?.actor?.id) ids.add(value.document.actor.id);
-    for (const key of ["targets","target","targetUuids","targetUUIDs","targetIds","tokens"]) {
+    for (const key of ["targets", "target", "targetUuids", "targetUUIDs", "targetIds", "tokens"]) {
       if (value[key]) visit(value[key]);
     }
   };
@@ -101,35 +120,57 @@ function collectTargetActorIds(...sources) {
   return ids;
 }
 
-function purgeOldAttacks() {
-  const cutoff = Date.now() - RECENT_ATTACK_MS;
-  while (recentMeleeAttacks.length && recentMeleeAttacks[0].time < cutoff) recentMeleeAttacks.shift();
-}
-
-function rememberMeleeAttack(activity, usageConfig = {}, results = {}) {
-  if (!isMeleeActivity(activity)) return;
-  const attacker = asActor(activity) ?? asActor(activity.item) ?? activity.actor ?? activity.item?.actor ?? null;
+async function rememberAttackOnActor(activity, usageConfig = {}, results = {}) {
+  if (!isMeleeActivity(activity)) {
+    console.log("Healing Blood | Atividade ignorada por não ser corpo a corpo:", activity);
+    return;
+  }
+  const attacker = asActor(activity) ?? asActor(getActivityItem(activity)) ?? activity.actor ?? getActivityItem(activity)?.actor ?? null;
   if (!attacker) return;
-  const targetActorIds = collectTargetActorIds(
+  const targets = collectTargetActorIds(
     usageConfig?.targets,
     usageConfig?.target,
     usageConfig?.targetUuids,
     results?.targets,
     results?.target,
     results?.targetUuids,
-    results
+    results,
+    game.user.targets
   );
-  recentMeleeAttacks.push({ time: Date.now(), attacker, targetActorIds, activity });
-  purgeOldAttacks();
-  console.log("Healing Blood | Ataque corpo a corpo registrado:", attacker.name, [...targetActorIds]);
+  const data = {
+    time: Date.now(),
+    attackerId: attacker.id,
+    attackerUuid: attacker.uuid,
+    targetActorIds: [...targets],
+    activityName: activity.name ?? getActivityItem(activity)?.name ?? "Ataque"
+  };
+  try {
+    await attacker.setFlag(HB_FLAG_SCOPE, HB_FLAG_ATTACK, data);
+    console.log("Healing Blood | Ataque corpo a corpo registrado:", attacker.name, data);
+  } catch (error) {
+    console.warn("Healing Blood | Não foi possível registrar ataque no Actor.", error);
+  }
 }
 
-function findRecentMeleeAttacker(targetActor) {
-  purgeOldAttacks();
-  const matching = [...recentMeleeAttacks].reverse().filter(entry =>
-    entry.targetActorIds.size === 0 || entry.targetActorIds.has(targetActor.id)
-  );
-  return matching[0] ?? null;
+function findRecentAttacker(targetActor) {
+  if (!targetActor) return null;
+  const now = Date.now();
+  let best = null;
+  for (const attacker of game.actors) {
+    const data = attacker.getFlag(HB_FLAG_SCOPE, HB_FLAG_ATTACK);
+    if (!data) continue;
+    const age = now - Number(data.time || 0);
+    if (age < 0 || age > RECENT_ATTACK_MS) continue;
+    const targets = Array.isArray(data.targetActorIds) ? data.targetActorIds : [];
+    if (targets.length > 0 && !targets.includes(targetActor.id)) continue;
+    if (!best || Number(data.time || 0) > Number(best.data.time || 0)) best = { attacker, data };
+  }
+  return best;
+}
+
+async function consumeAttackRecord(attacker) {
+  if (!attacker) return;
+  try { await attacker.unsetFlag(HB_FLAG_SCOPE, HB_FLAG_ATTACK); } catch (_) {}
 }
 
 async function healMeleeAttacker(attacker, targetActor, damage) {
@@ -142,9 +183,9 @@ async function healMeleeAttacker(attacker, targetActor, damage) {
   const effectiveHealing = await healActor(attacker, roll.total);
   await roll.toMessage({
     speaker: ChatMessage.getSpeaker({ actor: attacker }),
-    flavor: `<b>Healing Blood</b><br>${attacker.name} causou <b>${damage} de dano corpo a corpo</b> em ${targetActor.name}.<br>O sangue curativo concede <b>${dice}d4</b> de cura.<br>Resultado: <b>${roll.total}</b> | Cura efetiva: <b>${effectiveHealing} PV</b>.`
+    flavor: `<b>Healing Blood</b><br>${attacker.name} causou <b>${damage} de dano corpo a corpo</b> em ${targetActor.name}.<br>Para cada 7 de dano, o sangue curativo concede 1d4.<br>Cura: <b>${dice}d4 = ${roll.total}</b><br>Cura efetiva: <b>${effectiveHealing} PV</b>.`
   });
-  console.log(`Healing Blood | ${attacker.name} recuperou ${effectiveHealing} PV após causar ${damage} de dano corpo a corpo em ${targetActor.name}.`);
+  console.log(`Healing Blood | ${attacker.name} recuperou ${effectiveHealing} PV após causar ${damage} de dano em ${targetActor.name}.`);
 }
 
 Hooks.once("ready", () => {
@@ -153,11 +194,10 @@ Hooks.once("ready", () => {
     return;
   }
 
-  console.log("Healing Blood | Iniciando automação v1.0.2...");
+  console.log("Healing Blood | Iniciando automação v1.0.3...");
 
-  const activityHook = Hooks.on("dnd5e.postUseActivity", (activity, usageConfig = {}, results = {}) => {
-    if (!game.user.isGM) return;
-    rememberMeleeAttack(activity, usageConfig, results);
+  const activityHook = Hooks.on("dnd5e.postUseActivity", async (activity, usageConfig = {}, results = {}) => {
+    await rememberAttackOnActor(activity, usageConfig, results);
   });
 
   const actorDamageHook = Hooks.on("dnd5e.damageActor", async (actor, changes = {}, update = {}, userId) => {
@@ -175,50 +215,13 @@ Hooks.once("ready", () => {
 
     await accumulateDamage(actor, amount);
 
-    const attack = findRecentMeleeAttacker(actor);
+    const attack = findRecentAttacker(actor);
     if (attack?.attacker) {
       await healMeleeAttacker(attack.attacker, actor, amount);
-      const index = recentMeleeAttacks.indexOf(attack);
-      if (index >= 0) recentMeleeAttacks.splice(index, 1);
+      await consumeAttackRecord(attack.attacker);
+    } else {
+      console.log(`Healing Blood | ${actor.name} sofreu ${amount}, mas nenhum atacante corpo a corpo recente foi associado.`);
     }
-  });
-
-  const recentlyHealedApplications = new Map();
-
-  const applyDamageHook = Hooks.on("dnd5e.applyDamage", async (actor, amount, options = {}) => {
-    if (!game.user.isGM) return;
-    if (!actor) return;
-    if (!hasHealingBlood(actor)) return;
-
-    amount = Math.max(0, Number(amount) || 0);
-    if (amount <= 0) return;
-
-    let attacker = options?.sourceActor ?? options?.source?.actor ?? options?.actor ?? asActor(options?.activity) ?? asActor(options?.item) ?? null;
-    let activity = options?.activity ?? null;
-    let item = options?.item ?? options?.sourceItem ?? options?.source?.item ?? null;
-
-    if (typeof attacker === "string") {
-      try { attacker = await fromUuid(attacker); } catch (_) { attacker = null; }
-    }
-    if (typeof item === "string") {
-      try { item = await fromUuid(item); } catch (_) { item = null; }
-    }
-
-    attacker = asActor(attacker) ?? attacker;
-    let melee = isMeleeActivity(activity);
-    if (!melee && item) {
-      const actionType = String(item?.system?.actionType ?? "").toLowerCase();
-      melee = ["mwak", "msak"].includes(actionType);
-    }
-    if (!attacker || !melee) return;
-
-    const key = `${actor.id}:${attacker.id}:${amount}`;
-    const last = recentlyHealedApplications.get(key) ?? 0;
-    if (Date.now() - last < 1000) return;
-
-    recentlyHealedApplications.set(key, Date.now());
-    setTimeout(() => recentlyHealedApplications.delete(key), 1500);
-    await healMeleeAttacker(attacker, actor, amount);
   });
 
   const combatHook = Hooks.on("updateCombat", async (combat, changed) => {
@@ -269,15 +272,14 @@ Hooks.once("ready", () => {
 
   globalThis.HealingBloodAutomation = {
     active: true,
-    version: "1.0.2",
+    version: "1.0.3",
     activityHook,
     actorDamageHook,
-    applyDamageHook,
     combatHook,
     effectUpdateHook,
     effectDeleteHook
   };
 
-  ui.notifications.info("Healing Blood Automation v1.0.2 carregada.");
-  console.log("Healing Blood | Automação v1.0.2 ativa.");
+  ui.notifications.info("Healing Blood Automation v1.0.3 carregada.");
+  console.log("Healing Blood | Automação v1.0.3 ativa.");
 });
